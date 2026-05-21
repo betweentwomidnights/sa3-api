@@ -32,13 +32,45 @@ import re
 import math
 import requests as http_requests
 
-from stable_audio_3.pipeline import StableAudioPipeline
+# Public release (engine SOURCE_COMMIT ab06db7+) removed pipeline.py and merged
+# StableAudioPipeline into StableAudioModel — same internal layout (.model,
+# .model_config, .device, ._adapt_sample_size, .generate, .load_lora, ...), so
+# the `pipe` variable below maps 1:1. Comments referencing "pipeline.py" are
+# historical; that logic now lives in stable_audio_3/model.py.
+from stable_audio_3 import StableAudioModel
 from stable_audio_3.inference.distribution_shift import (
     LogSNRShift,
     FluxDistributionShift,
     DistributionShift,
     IdentityDistributionShift,
 )
+
+# ---------------------------------------------------------------------------
+# Cached-pre-release weights shim (SA3_USE_CACHED_PRERELEASE)
+# ---------------------------------------------------------------------------
+# The public release re-pointed `medium` at the GATED canonical files
+# (stabilityai/stable-audio-3-medium: model_config.json + model.safetensors) and
+# the text conditioner at google/t5gemma-b-b-ul2. Our HF cache only holds the
+# PRE-RELEASE files — stable-audio-3-medium-ARC.{json,safetensors} + the
+# stabilityai/t5gemma-b-b-ul2 mirror — and the gated medium repo currently 403s
+# for this account (re-accept the license to restore access). `medium` IS the
+# ARC checkpoint, so loading the cached ARC files via the new engine yields the
+# canonical model; only two name remaps are needed, and load stays fully offline.
+# Flip this off (and fetch canonical weights) once HF access is restored.
+if os.environ.get("SA3_USE_CACHED_PRERELEASE", "0") == "1":
+    import stable_audio_3.models.conditioners as _cond
+    _C = _cond.T5GemmaConditioner
+    if "stabilityai/t5gemma-b-b-ul2" not in _C.T5GEMMA_MODELS:
+        _C.T5GEMMA_MODELS = list(_C.T5GEMMA_MODELS) + ["stabilityai/t5gemma-b-b-ul2"]
+        _C.T5GEMMA_MODEL_DIMS["stabilityai/t5gemma-b-b-ul2"] = \
+            _C.T5GEMMA_MODEL_DIMS["google/t5gemma-b-b-ul2"]
+    import stable_audio_3.model_configs as _mc
+    _mc.all_models["medium"] = _mc.ModelConfig(
+        "stabilityai/stable-audio-3-medium",
+        "stable-audio-3-medium-ARC.json",
+        "stable-audio-3-medium-ARC.safetensors",
+    )
+    print("[shim] SA3_USE_CACHED_PRERELEASE=1 -> medium=ARC cache + t5gemma mirror")
 
 app = Flask(__name__)
 
@@ -382,7 +414,7 @@ def load_pipeline(force_rebuild: bool = False):
 
         t0 = time.time()
         print(f"Loading Stable Audio 3 pipeline: model={MODEL_NAME} half={MODEL_HALF}")
-        pipe = StableAudioPipeline.from_pretrained(MODEL_NAME, model_half=MODEL_HALF)
+        pipe = StableAudioModel.from_pretrained(MODEL_NAME, model_half=MODEL_HALF)
 
         registry = scan_lora_dir()
         if registry:
