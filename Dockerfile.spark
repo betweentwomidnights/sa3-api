@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1.7
+#
+# SA3 API serving image — DGX Spark.
+#
+# Base: sa3:spark (deps-only — torch 2.7.1 cu128 w/ Blackwell SASS, flash-attn
+# built from source, transformers). It bakes NO stable_audio_3 source
+# (`uv sync --no-install-project`), so the inference code is vendored here via
+# COPY (run ./sync_engine.sh first) — that, not a base rebuild, is what makes
+# the served code track ~/stable-audio-3 main. pytorch_lightning is NOT needed
+# (it's training-only; .ckpt LoRA load is just torch.load + ["state_dict"]),
+# so we stay on sa3:spark rather than sa3:spark-lightning.
+#
+# Build (context = ~/sa3):
+#   ./sync_engine.sh
+#   docker build -f Dockerfile.spark -t sa3-api:spark .
+FROM sa3:spark
+
+# flask + requests are both absent from the sa3:spark venv. Use `uv pip install`
+# against the venv (NOT `uv sync` — that reconciles against the lockfile and
+# silently uninstalls the cu128 torch). Same pattern as Dockerfile.spark.lightning.
+RUN uv pip install --python /opt/sa3-venv/bin/python flask requests
+
+# Vendored current-main inference package -> import root.
+COPY engine/stable_audio_3 /workspace/sa3/stable_audio_3
+COPY engine/SOURCE_COMMIT /workspace/sa3/SOURCE_COMMIT
+
+# Default LoRA (blessed upstream-defaults step-3000 baseline) + API server.
+COPY loras /app/loras
+COPY api.py /app/api.py
+
+# Bake the container-invocation gotchas (see feedback_sa3_docker_invocation):
+#   - import root for the vendored package
+#   - offline so the t5gemma additional_chat_templates 404 can't fail load
+ENV PYTHONPATH=/workspace/sa3 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    HF_HOME=/cache/huggingface \
+    OUTPUT_DIR=/app/outputs \
+    PORT=8016
+
+WORKDIR /app
+EXPOSE 8016
+
+# Explicit venv python — `python`/`uv run` would miss the cu128 torch.
+CMD ["/opt/sa3-venv/bin/python", "/app/api.py"]
