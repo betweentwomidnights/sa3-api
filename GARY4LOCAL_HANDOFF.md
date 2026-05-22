@@ -29,6 +29,9 @@ The engine's `pyproject.toml` declares everything; on x86 it's painless:
   ~/stable-audio-3` in the checkout. (The Spark *vendors* the package via
   `sync_engine.sh` + `PYTHONPATH` to bake a self-contained image — a fresh machine
   pulling `main` doesn't need that.)
+- **Then apply our `latent_prefix` engine patch — it is NOT in upstream.** Without
+  it, the `latent_prefix` mode is dead-on-arrival (the API kwargs get ignored). See
+  the latent_prefix section below for the one `git apply` command.
 
 ## Weights — canonical, NO shim
 
@@ -50,13 +53,26 @@ The engine's `pyproject.toml` declares everything; on x86 it's painless:
 
 ## What we added on top of stock SA3 (replicate these)
 
-- **`latent_prefix` continuation mode** (our feature). Engine support = the
-  `sample_flow_pingpong` patch in `stable_audio_3/inference/sampling.py` (already on
-  `main`). Drive it via `model.generate(..., fixed_prefix_data=<encoded source
-  latents>, fixed_prefix_mask=<latent mask, 1 = prefix tokens>)` with
-  `sampler_type="pingpong"` (the only sampler that imposes the prefix). Orchestration
-  reference: this repo's `/continue` worker in `api.py`, plus the standalone
-  `~/stable-audio-3/test_latent_prefix.py`. Client contract: `SA3_API_HANDOFF.md`.
+- **`latent_prefix` continuation mode** (our feature) — needs BOTH halves:
+  1. **Engine patch — REQUIRED, and NOT in upstream Stable Audio 3.**
+     `engine-patches/latent-prefix-sampling.patch` (in this repo) teaches
+     `sample_flow_pingpong` (in `stable_audio_3/inference/sampling.py`) to accept
+     `fixed_prefix_data` / `fixed_prefix_mask`. It's our local cherry-pick — upstream
+     `sampling.py` has none of it, so the API kwargs would otherwise be silently
+     dropped. Apply it to your engine checkout after install (verified to apply
+     cleanly to current upstream `main`):
+     ```
+     cd <your stable-audio-3 checkout>
+     git apply /path/to/sa3-api/engine-patches/latent-prefix-sampling.patch
+     ```
+  2. **api.py orchestration** (the `/continue` `continuation_mode="latent_prefix"`
+     path): encode the source via `model._encode_audio_input` → `fixed_prefix_data`;
+     build a latent mask (1 for the first `round(source_samples / downsampling_ratio)`
+     tokens) sized to `model._adapt_sample_size(...)` so it matches the sampler's
+     latent length; call `model.generate(..., fixed_prefix_data=, fixed_prefix_mask=)`
+     with `sampler_type="pingpong"` (the only sampler that imposes the prefix).
+     Reference: this repo's `/continue` worker in `api.py`, plus the standalone
+     `~/stable-audio-3/test_latent_prefix.py`. Client contract: `SA3_API_HANDOFF.md`.
 - **Serving loudness chain** (in `api.py`'s worker): adaptive latent rescale →
   tanh soft-knee true-peak limiter, plus the `/continue` `regen_past` tail. The
   blessed LoRA runs hot and clips long gens without it. Production-tuned env values
