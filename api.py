@@ -732,6 +732,47 @@ def generation_worker(session_id: str, params: dict):
                 gen_kwargs["inpaint_mask_start_seconds"] = cont["mask_start_seconds"]
                 gen_kwargs["inpaint_mask_end_seconds"] = cont["mask_end_seconds"]
 
+                # latent_prefix: on top of the inpaint conditioning above, pin the
+                # encoded source as a FIXED latent prefix that the pingpong sampler
+                # re-noises to the right level at each sigma (sample_flow_pingpong
+                # patch). The tail then inherits the source tempo/timbre more
+                # strongly than stock inpainting. fixed_prefix_* flow through
+                # generate -> sample_diffusion(**sampler_kwargs) -> pingpong with
+                # no engine change, and pass straight through the return_latents
+                # loudness path too. Requires the pingpong sampler (forced in
+                # /continue for this mode).
+                if cont["mode"] == "latent_prefix":
+                    # Mirror the audio_sample_size generate() derives (same args:
+                    # MAX_SAMPLE_SIZE + 6.0s padding) so the prefix mask aligns
+                    # with the sampler's latent length.
+                    asz = pipe._adapt_sample_size(
+                        [{"prompt": prompt, "seconds_total": duration}],
+                        MAX_SAMPLE_SIZE, 6.0,
+                    )
+                    ds = pipe.model.pretransform.downsampling_ratio
+                    latent_len = asz // ds
+                    # _encode_audio_input -> prepare_audio resamples/channels and
+                    # pads the source to asz at the head, then encodes to latents.
+                    fixed_prefix_data, _ = pipe._encode_audio_input(
+                        cont["inpaint_audio"], asz, None
+                    )
+                    prefix_samples = round(cont["source_duration"] * sample_rate)
+                    prefix_tokens = min(latent_len,
+                                        max(1, round(prefix_samples / ds)))
+                    fixed_prefix_mask = torch.zeros(
+                        1, 1, latent_len,
+                        device=fixed_prefix_data.device,
+                        dtype=fixed_prefix_data.dtype,
+                    )
+                    fixed_prefix_mask[:, :, :prefix_tokens] = 1.0
+                    gen_kwargs["fixed_prefix_data"] = fixed_prefix_data
+                    gen_kwargs["fixed_prefix_mask"] = fixed_prefix_mask
+                    cont["prefix_latent_tokens"] = int(prefix_tokens)
+                    cont["latent_sample_size"] = int(latent_len)
+                    print(f"[{session_id}] latent_prefix: asz={asz} "
+                          f"latent_len={latent_len} prefix_tokens={prefix_tokens} "
+                          f"prefix_data={tuple(fixed_prefix_data.shape)}")
+
             # Per-request loudness levers (default to env via _build_params).
             rescale = params.get("latent_rescale", LATENT_RESCALE)
             shift_l = params.get("latent_shift", LATENT_SHIFT)
@@ -984,6 +1025,9 @@ def generation_worker(session_id: str, params: dict):
                     "input_channels": cont["input_channels"],
                     "target_samples": cont["target_samples"],
                     "diag": params.get("_cont_diag"),
+                    "prefix_latent_tokens": cont.get("prefix_latent_tokens"),
+                    "latent_sample_size": cont.get("latent_sample_size"),
+                    "requested_sampler_type": params.get("requested_sampler_type"),
                 } if cont else None),
                 "loudness": {
                     "latent_rescale": params.get("latent_rescale"),
@@ -1491,7 +1535,7 @@ def transform():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-VALID_CONTINUATION_MODES = ["inpaint"]   # "latent_prefix" reserved (not yet)
+VALID_CONTINUATION_MODES = ["inpaint", "latent_prefix"]
 
 
 @app.route("/continue", methods=["POST"])
@@ -1504,7 +1548,10 @@ def continue_audio():
     Body: same as /generate (NO duration — derived), plus:
       audio_data           (str, required) base64 WAV — the source to continue
       continuation_seconds (float, default 8.0) how much new audio after source
-      continuation_mode    (str, default "inpaint"; "latent_prefix" reserved)
+      continuation_mode    (str, default "inpaint") "inpaint" = stock fill-forward;
+                           "latent_prefix" = pin the encoded source as a fixed
+                           latent prefix (stronger tempo/timbre carry-over; forces
+                           the pingpong sampler)
 
     The source occupies [0, source_dur] (kept); the model regenerates
     [source_dur, total] toward the prompt. The kept region is re-encoded
@@ -1529,8 +1576,7 @@ def continue_audio():
             return jsonify({
                 "success": False,
                 "error": f"continuation_mode must be one of "
-                         f"{VALID_CONTINUATION_MODES} (latent_prefix not yet "
-                         f"implemented)",
+                         f"{VALID_CONTINUATION_MODES}",
             }), 400
 
         b64 = data.get("audio_data")
@@ -1575,6 +1621,14 @@ def continue_audio():
             params = _build_params(data)
         except ValueError as e:
             return jsonify({"success": False, "error": str(e)}), 400
+
+        # latent_prefix is imposed only inside sample_flow_pingpong, so force the
+        # pingpong sampler for this mode (no-op for the default).
+        if mode == "latent_prefix" and params.get("sampler_type") != "pingpong":
+            params["requested_sampler_type"] = params.get("sampler_type")
+            params["sampler_type"] = "pingpong"
+            print(f"[continue] latent_prefix forces pingpong sampler "
+                  f"(requested {params['requested_sampler_type']})")
 
         # Tail pad — frontend slider (`continuation_tail_pad`), default = env
         # CONTINUE_TAIL_PAD. 0 ≈ full composed ending at `total`; ~6 natural

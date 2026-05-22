@@ -77,8 +77,26 @@ Output is the **exact same length & channel count** as the input
 **No `duration`.** Extra:
 - `audio_data` — base64 WAV source (required)
 - `continuation_seconds` — float, default `8.0`
-- `continuation_mode` — `"inpaint"` (default). `"latent_prefix"` is
-  reserved and currently returns 400 — **don't expose it yet.**
+- `continuation_mode` — `"inpaint"` (default) or `"latent_prefix"` (live as of
+  2026-05-21). **This is the new toggle to wire.**
+  - `"inpaint"` — stock fill-forward; what the Continue tab ships today.
+  - `"latent_prefix"` — pins the encoded source as a *fixed latent prefix* that
+    the sampler re-noises at each step, so the continuation inherits the
+    source's tempo/timbre more strongly. **Same request body and same
+    sample-exact output** as inpaint — the only client change is sending this
+    field. It internally forces the pingpong sampler (any `sampler_type` you
+    send is ignored for this mode and echoed back as
+    `meta.continue.requested_sampler_type`).
+  - **To wire it:** the Continue tab currently hard-codes `"inpaint"`. Add a
+    small toggle / segmented control (e.g. *"Continue style: Inpaint |
+    Latent-prefix"*) that sets this one field — nothing else changes. Best UX is
+    to A/B the two on the **same source + same seed** so the user can feel the
+    difference.
+  - `meta.continue` for this mode also reports `prefix_latent_tokens` /
+    `latent_sample_size` (diagnostics). If you ever want the "keep the pristine
+    source on the timeline, drop only the generated tail" workflow, use
+    `meta.continue.source_duration` to split the returned WAV at the source/tail
+    boundary — optional; the default full-WAV output drops in fine as-is.
 - `continuation_tail_pad` — float seconds, **default `6.0`**. **Expose as an
   advanced slider** (range `0`–`60`, default `6`). Controls how the
   continuation *ends*:
@@ -183,7 +201,8 @@ stays warm by default).
   remap is planned server-side; for now, if you expose the slider, bias its
   travel toward the top end or label it clearly. Flag to backend before
   shipping that slider.
-- **Don't expose `continuation_mode=latent_prefix`** — not implemented (400).
+- **`continuation_mode=latent_prefix` is now live** (forces pingpong; see the
+  `/sa3/continue` section). Earlier builds 400'd it — implemented 2026-05-21.
 - **Seed**: always read it back from the response/`meta` and keep it with
   the take so "regenerate / variation" can reuse or perturb it.
 - **Lengths are sample-exact** for loop/transform/continue — you can place
