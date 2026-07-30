@@ -26,6 +26,10 @@ COPY engine/SOURCE_COMMIT /workspace/sa3/SOURCE_COMMIT
 
 # Default LoRA (blessed upstream-defaults step-3000 baseline) + API server.
 COPY loras /app/loras
+# Decoder-targeted LoRAs, kept OUT of /app/loras so they never enter the
+# selectable DiT registry. Bind-mounted in compose too, so checkpoints can be
+# swapped with a recreate rather than a rebuild.
+COPY decoder_loras /app/decoder_loras
 COPY api.py /app/api.py
 
 # Bake the container-invocation gotchas (see feedback_sa3_docker_invocation):

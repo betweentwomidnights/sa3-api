@@ -1,0 +1,4 @@
+# Checkpoints are large binaries served from the bind mount, not versioned here.
+*.safetensors
+*.ckpt
+!.gitignore

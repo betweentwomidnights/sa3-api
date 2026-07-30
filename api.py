@@ -65,12 +65,48 @@ if os.environ.get("SA3_USE_CACHED_PRERELEASE", "0") == "1":
         _C.T5GEMMA_MODEL_DIMS["stabilityai/t5gemma-b-b-ul2"] = \
             _C.T5GEMMA_MODEL_DIMS["google/t5gemma-b-b-ul2"]
     import stable_audio_3.model_configs as _mc
-    _mc.all_models["medium"] = _mc.ModelConfig(
+    from huggingface_hub import hf_hub_download as _hf_dl
+
+    # Option A pin: resolve medium-ARC against a FIXED cache snapshot, never the
+    # floating `main` ref. The public release deleted the pre-release ARC files
+    # from `main` on the Hub, so any tool that pulls stabilityai/stable-audio-3-medium
+    # WITHOUT a revision (e.g. a medium-base training `snapshot_download`) advances
+    # cached refs/main to a snapshot lacking the ARC files -> next `restart sa3`
+    # fails to load offline -> "no loras available". Pinning the revision makes the
+    # load immune to that churn. Default = the pre-release snapshot holding
+    # stable-audio-3-medium-ARC.{json,safetensors}; override via SA3_MEDIUM_REVISION.
+    # TODO(B): drop this whole shim once the image is rebuilt to the public layout
+    # (canonical model_config.json/model.safetensors).
+    _MEDIUM_REV = os.environ.get(
+        "SA3_MEDIUM_REVISION", "95254c200f566987e3ad73492994fa7869d67f51"
+    )
+
+    class _PinnedModelConfig:
+        """Duck-typed ModelConfig — from_pretrained only calls .resolve() — that
+        resolves a fixed revision so loading never depends on refs/main."""
+
+        def __init__(self, repo_id, config_path, ckpt_path, revision):
+            self.repo_id = repo_id
+            self.config_path = config_path
+            self.ckpt_path = ckpt_path
+            self.revision = revision
+
+        def resolve(self):
+            return (
+                _hf_dl(self.repo_id, self.config_path, revision=self.revision),
+                _hf_dl(self.repo_id, self.ckpt_path, revision=self.revision),
+            )
+
+    _mc.all_models["medium"] = _PinnedModelConfig(
         "stabilityai/stable-audio-3-medium",
         "stable-audio-3-medium-ARC.json",
         "stable-audio-3-medium-ARC.safetensors",
+        _MEDIUM_REV,
     )
-    print("[shim] SA3_USE_CACHED_PRERELEASE=1 -> medium=ARC cache + t5gemma mirror")
+    print(
+        f"[shim] SA3_USE_CACHED_PRERELEASE=1 -> medium=ARC cache "
+        f"(pinned rev {_MEDIUM_REV[:8]}) + t5gemma mirror"
+    )
 
 app = Flask(__name__)
 
@@ -93,6 +129,38 @@ PROMPTS_DIR = os.environ.get("SA3_PROMPTS_DIR", "/app/prompts")
 LORA_EXTS = (".ckpt", ".safetensors")
 # Name (file stem) used when a request doesn't specify any LoRA.
 DEFAULT_LORA_NAME = os.environ.get("SA3_DEFAULT_LORA_NAME", "kev")
+
+# ---------------------------------------------------------------------------
+# Decoder LoRA (SA3_DECODER_LORA) — the HF-squeak fix
+# ---------------------------------------------------------------------------
+# A LoRA on SAME's *decoder*, not the DiT. SAME downsamples 4096x (one latent
+# frame per 93ms of stereo) so it cannot carry a snare or hi-hat attack — it
+# resynthesizes one, slightly differently every pass. That produces the
+# squeaks/chirps on percussion and guitar, and it compounds under repeated
+# encode/decode. This adapter is trained with round-trip consistency plus a
+# one-sided HF tonality penalty, encoder frozen, so the latent space, the DiT
+# and every existing DiT LoRA stay bit-compatible.
+#
+# Measured on held-out music through a 4-round-trip ladder: invented HF on
+# percussive attacks improves 3.7dB, and the round-trip tonality runaway drops
+# from ~+6.7dB to ~+1.1dB. On a single generation the effect is smaller but
+# audible (ear-confirmed on koan breakcore/neurofunk).
+#
+# Kept in its OWN directory, deliberately: LORA_DIR is scanned into the
+# selectable DiT registry that /loras exposes to the frontend, and a
+# decoder-targeted adapter listed there would be offered as a DiT LoRA it can
+# never act as. Separate dir = no exclusion logic and no way to mis-select it.
+#
+# Empty SA3_DECODER_LORA = off. Both are recreate-only (the file lives in a
+# bind mount, so swapping checkpoints needs no rebuild).
+DECODER_LORA_DIR = os.environ.get("SA3_DECODER_LORA_DIR", "/app/decoder_loras")
+DECODER_LORA = os.environ.get("SA3_DECODER_LORA", "").strip()
+try:
+    DECODER_LORA_STRENGTH = float(
+        os.environ.get("SA3_DECODER_LORA_STRENGTH", "1.0"))
+except ValueError:
+    DECODER_LORA_STRENGTH = 1.0
+
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/app/outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -156,6 +224,60 @@ LOOP_PAD_SECONDS = float(os.environ.get("SA3_LOOP_PAD_SECONDS", "2.0"))
 CONTINUE_TAIL_MODE = os.environ.get("SA3_CONTINUE_TAIL_MODE", "regen_past").lower()
 CONTINUE_TAIL_PAD = float(os.environ.get("SA3_CONTINUE_TAIL_PAD", "6.0"))
 CONTINUE_TAIL_PAD_MAX = float(os.environ.get("SA3_CONTINUE_TAIL_PAD_MAX", "60.0"))
+
+# /continue mask overlap (the seam-on-the-downbeat fix). Pull the inpaint mask
+# START back this many seconds *before* the true end of the source, so the kept
+# region ends MID-PHRASE instead of exactly on the bar line. A clip that ends on
+# the bar reads to the model as a completed phrase, so stock conditioning-based
+# inpaint composes a "breath" — the silent 8th/quarter you hear right at the
+# downbeat of bar-aligned loops. Moving the seam off the grid removes that
+# cadence cue and the model grooves straight through. The overlap slice
+# [source-overlap, source] gets regenerated (not kept), but the output length is
+# unchanged: mask_end / target_samples still derive from source+continuation, so
+# the model's grid-aligned continuation lands where it should. 0.0 = off
+# (current behavior, seam exactly at source end). Per-request override:
+# `continuation_mask_overlap`. ~0.2s (≈ an 8th-to-quarter note) is a good start.
+CONTINUE_MASK_OVERLAP = float(os.environ.get("SA3_CONTINUE_MASK_OVERLAP", "0.0"))
+
+# /continue source splice — the round-trip artifact fix.
+#
+# A continuation re-encodes the source through the autoencoder, so the kept
+# region of the output is the VAE's *re-render* of the input, not the input.
+# SAME downsamples 4096x (~10.77 latent frames/sec, one frame per 93ms of
+# stereo), so it cannot carry a snare or hi-hat attack — it resynthesizes one,
+# slightly differently every pass. Measured over 6 round trips, the added
+# high-frequency energy climbs ~15dB while lost HF stays flat: the autoencoder
+# manufactures high end rather than dulling it, and the damage concentrates on
+# percussive attacks (transient-vs-sustain excess grows +4.2 -> +12.0 dB).
+# Chained continuations in the mobile app put audio through that loop N times,
+# which is why the squeaks compound.
+#
+# Fix: after decode, paste the ORIGINAL source audio back over the kept region
+# [0, mask_start] so it never accumulates a round trip. The regenerated region
+# [mask_start, ...] is untouched — that content only exists as model output.
+# The splice happens BEFORE the loudness stages, so the original and the
+# generated tail go through the identical peak-normalize + limiter chain and
+# come back sounding like one song rather than two spliced takes.
+#
+# The seam sits just before mask_start, inside the region where both signals
+# are the SAME music (source vs its re-render), not at the musical hand-off.
+# Equal-power crossfade. Keep it short: the two signals are correlated at low
+# frequencies and decorrelated up top, so a long blend combs. ~30ms is enough
+# to kill a click and short enough that the comb is inaudible.
+#
+# 1 = on (default). Flip to 0 + `docker compose up -d sa3` (recreate, no
+# rebuild) if the seam turns out to be audible in the app.
+CONTINUE_SPLICE_SOURCE = os.environ.get(
+    "SA3_CONTINUE_SPLICE_SOURCE", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
+CONTINUE_SPLICE_XFADE = float(os.environ.get("SA3_CONTINUE_SPLICE_XFADE", "0.03"))
+# Scalar-match the original's level to the model's re-render of the same region
+# before crossfading, so the seam has no level step and the downstream
+# peak-normalize is not driven by whichever side happened to be hotter. Scalar
+# gain only — it does not touch the transients we are trying to preserve.
+CONTINUE_SPLICE_GAIN_MATCH = os.environ.get(
+    "SA3_CONTINUE_SPLICE_GAIN_MATCH", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
 
 # Lift the engine's 120s sample_size cap (pipeline.py default 5292032 ≈120s;
 # _adapt_sample_size returns min(needed, sample_size), so long gens/continues
@@ -351,6 +473,8 @@ model_resident = False             # is the model currently on the GPU?
 last_load_seconds = 0.0            # wall time of the most recent (cold) load
 model_sample_rate = None           # cached so /health needn't touch the model
 model_device = None
+decoder_lora_index = None          # registry index of the decoder LoRA, if any
+decoder_lora_name = None
 
 
 def cuda_mem_mb():
@@ -371,6 +495,31 @@ def cuda_mem_mb():
 # restarts (clients can address by name regardless).
 lora_registry = []
 lora_name_to_index = {}
+
+
+def _iter_decoder_lora_params(pipe):
+    """Adapter params living on the autoencoder decoder (not the DiT)."""
+    dec = getattr(
+        getattr(getattr(pipe.model, "pretransform", None), "model", None),
+        "decoder", None)
+    if dec is None:
+        return
+    for name, prm in dec.named_parameters():
+        if "lora_" in name:
+            yield prm
+
+
+def resolve_decoder_lora():
+    """Absolute path of the configured decoder LoRA, or None if off/missing."""
+    if not DECODER_LORA:
+        return None
+    path = (DECODER_LORA if os.path.isabs(DECODER_LORA)
+            else os.path.join(DECODER_LORA_DIR, DECODER_LORA))
+    if not os.path.isfile(path):
+        print(f"WARNING: SA3_DECODER_LORA={DECODER_LORA!r} -> {path} not found; "
+              f"serving WITHOUT the decoder LoRA")
+        return None
+    return path
 
 
 def scan_lora_dir():
@@ -402,6 +551,7 @@ def load_pipeline(force_rebuild: bool = False):
     the model and has no incremental add, so a fresh build is the clean path)."""
     global _pipe, lora_registry, lora_name_to_index, model_resident
     global last_load_seconds, model_sample_rate, model_device
+    global decoder_lora_index, decoder_lora_name
     with pipe_lock:
         if _pipe is not None and not force_rebuild:
             return _pipe
@@ -417,19 +567,39 @@ def load_pipeline(force_rebuild: bool = False):
         pipe = StableAudioModel.from_pretrained(MODEL_NAME, model_half=MODEL_HALF)
 
         registry = scan_lora_dir()
-        if registry:
-            paths = [p for _, p in registry]
-            print(f"  Preloading {len(paths)} LoRA(s): "
-                  f"{[n for n, _ in registry]}")
+        # The decoder LoRA is appended AFTER every DiT LoRA, so DiT registry
+        # indices stay 0..len(registry)-1 and the decoder takes len(registry).
+        # It is deliberately NOT added to `registry`, so it never appears in
+        # lora_name_to_index and cannot be selected as a DiT LoRA.
+        dec_path = resolve_decoder_lora()
+        dec_index = len(registry) if dec_path else None
+        paths = [p for _, p in registry] + ([dec_path] if dec_path else [])
+        if paths:
+            print(f"  Preloading {len(registry)} DiT LoRA(s): "
+                  f"{[n for n, _ in registry]}"
+                  + (f" + decoder LoRA {os.path.basename(dec_path)} "
+                     f"@ index {dec_index}" if dec_path else ""))
             pipe.load_lora(paths)
             loaded = getattr(pipe.model, "lora_names", [])
             print(f"  LoRA registry (index->name): "
                   f"{dict(enumerate(loaded))}")
+            if dec_path:
+                pipe.set_lora_strength(DECODER_LORA_STRENGTH,
+                                       lora_index=dec_index)
+                dec_tensors = sum(
+                    1 for _ in _iter_decoder_lora_params(pipe))
+                print(f"  decoder LoRA strength={DECODER_LORA_STRENGTH} "
+                      f"({dec_tensors} tensors on the decoder)")
+                if dec_tensors == 0:
+                    print("  WARNING: decoder LoRA loaded but attached NO "
+                          "tensors to the decoder — it will have no effect")
         else:
             print(f"  No LoRA files in {LORA_DIR} — serving base model only")
 
         lora_registry = registry
         lora_name_to_index = {name: i for i, (name, _) in enumerate(registry)}
+        decoder_lora_index = dec_index
+        decoder_lora_name = os.path.basename(dec_path) if dec_path else None
 
         _pipe = pipe
         model_resident = True
@@ -623,6 +793,82 @@ def validate_request(data: dict) -> list:
 
 
 # ---------------------------------------------------------------------------
+# /continue source splice (see CONTINUE_SPLICE_SOURCE)
+# ---------------------------------------------------------------------------
+
+def _match_channels(wave, target_channels):
+    """[C, T] -> [target_channels, T] by mixdown or duplication."""
+    c = wave.shape[0]
+    if c == target_channels:
+        return wave
+    if c > target_channels:
+        return wave.mean(dim=0, keepdim=True).repeat(target_channels, 1)
+    return wave[:1].repeat(target_channels, 1)
+
+
+def _splice_continuation_source(audio, cont, sample_rate, session_id):
+    """Paste the ORIGINAL source back over a continuation's kept region.
+
+    audio: [b, d, n] decoded model output at the model sample rate. The source
+    is head-aligned at sample 0 (PadCrop(randomize=False) writes at index 0 and
+    zero-pads the tail), so the kept region is exactly [0, mask_start).
+
+    Only the kept region is touched. [mask_start, ...] is the model's own
+    regenerated content and has never been round-tripped, so it is left alone.
+    """
+    in_sr, wave = cont["inpaint_audio"]
+    mask_start = float(cont.get("mask_start_seconds") or 0.0)
+    if mask_start <= 0.0:
+        return audio, "mask_start<=0"
+
+    wave = wave.detach().to(torch.float32)
+    if int(in_sr) != int(sample_rate):
+        wave = torchaudio.transforms.Resample(int(in_sr), int(sample_rate))(wave)
+    wave = _match_channels(wave, audio.shape[1])
+
+    splice_end = int(round(mask_start * sample_rate))
+    splice_end = min(splice_end, wave.shape[-1], audio.shape[-1])
+    if splice_end <= 0:
+        return audio, "no overlap"
+
+    xfade = int(round(max(0.0, CONTINUE_SPLICE_XFADE) * sample_rate))
+    xfade = max(0, min(xfade, splice_end // 2))
+    hard_end = splice_end - xfade
+
+    src = wave[..., :splice_end].to(device=audio.device, dtype=audio.dtype)
+
+    gain = 1.0
+    if CONTINUE_SPLICE_GAIN_MATCH:
+        mdl_rms = float(audio[..., :splice_end].detach().to(torch.float32)
+                        .pow(2).mean().sqrt())
+        src_rms = float(src.detach().to(torch.float32).pow(2).mean().sqrt())
+        if src_rms > 1e-6 and mdl_rms > 1e-6:
+            gain = min(4.0, max(0.25, mdl_rms / src_rms))
+            src = src * gain
+
+    out = audio.clone()
+    if hard_end > 0:
+        out[..., :hard_end] = src[..., :hard_end].unsqueeze(0)
+    if xfade > 0:
+        # Equal-power crossfade so the blend holds energy constant. The two
+        # signals here are the same music (source vs its re-render), correlated
+        # low and decorrelated high, so this window stays deliberately short.
+        r = torch.linspace(0.0, 1.0, xfade, device=audio.device,
+                           dtype=torch.float32)
+        w_src = torch.cos(r * math.pi / 2).to(audio.dtype)
+        w_mdl = torch.sin(r * math.pi / 2).to(audio.dtype)
+        out[..., hard_end:splice_end] = (
+            src[..., hard_end:splice_end].unsqueeze(0) * w_src
+            + audio[..., hard_end:splice_end] * w_mdl
+        )
+
+    info = (f"kept 0-{splice_end / sample_rate:.3f}s "
+            f"xfade {xfade / sample_rate * 1000:.0f}ms "
+            f"gain {gain:.3f}")
+    return out, info
+
+
+# ---------------------------------------------------------------------------
 # Background generation worker
 # ---------------------------------------------------------------------------
 
@@ -675,7 +921,11 @@ def generation_worker(session_id: str, params: dict):
                 print(f"[{session_id}] cold-loaded model in "
                       f"{cold_load_seconds}s (MANAGE_MODEL_LIFECYCLE on)")
             sample_rate = int(pipe.model_config["sample_rate"])
-            n_loras = len(getattr(pipe.model, "lora_names", []))
+            # Count only the selectable DiT LoRAs. lora_names includes the
+            # decoder adapter, and the zeroing loop below would set its
+            # strength to 0 on every request (it is never in `requested`),
+            # silently disabling it.
+            n_loras = len(lora_registry)
             dist_shift = resolve_dist_shift(pipe, shift)
 
             requested = {c["lora_index"]: c for c in loras}
@@ -686,6 +936,12 @@ def generation_worker(session_id: str, params: dict):
                     requested[idx]["strength"] if idx in requested else 0.0,
                     lora_index=idx,
                 )
+            # Re-assert the decoder adapter's strength inside the same lock.
+            # Belt-and-braces: nothing above touches it now, but LoRA strengths
+            # are global mutable state and this keeps it correct if that changes.
+            if decoder_lora_index is not None:
+                pipe.set_lora_strength(DECODER_LORA_STRENGTH,
+                                       lora_index=decoder_lora_index)
             # lora_configs drives per-LoRA sigma-interval + layer_filter gating
             # inside the DiT forward (dit.py:458-470), exactly like gradio.
             lora_configs = [
@@ -787,6 +1043,12 @@ def generation_worker(session_id: str, params: dict):
             )
             if not use_latent_path:
                 audio = pipe.generate(**gen_kwargs)
+                _c = params.get("continue")
+                if CONTINUE_SPLICE_SOURCE and _c:
+                    audio, _info = _splice_continuation_source(
+                        audio, _c, sample_rate, session_id
+                    )
+                    print(f"[{session_id}] continue splice: {_info}")
             else:
                 # return_latents -> pipeline skips its internal clamp & decode;
                 # we apply the loudness stages, then decode (mirror the gradio
@@ -827,6 +1089,20 @@ def generation_worker(session_id: str, params: dict):
                 elif apply_rescale:
                     latents = latents * rescale + shift_l
 
+                # return_latents bypasses the engine's normal decode boundary,
+                # which casts sampler output to the autoencoder dtype. CFG can
+                # return float32 latents while the half-loaded decoder expects
+                # float16, so mirror that boundary before manual decode.
+                decoder_param = next(pipe.model.pretransform.parameters())
+                if (latents.dtype != decoder_param.dtype
+                        or latents.device != decoder_param.device):
+                    print(f"[{session_id}] decode cast "
+                          f"{latents.device}/{latents.dtype} -> "
+                          f"{decoder_param.device}/{decoder_param.dtype}")
+                    latents = latents.to(
+                        device=decoder_param.device,
+                        dtype=decoder_param.dtype,
+                    )
                 audio = pipe.model.pretransform.decode(latents)
 
                 # return_latents skips the pipeline's truncate-to-duration;
@@ -835,6 +1111,16 @@ def generation_worker(session_id: str, params: dict):
                     keep = int(duration * sample_rate)
                     if audio.shape[-1] > keep:
                         audio = audio[..., :keep]
+
+                # Source splice BEFORE the loudness stages, so the pasted-in
+                # original and the generated tail go through the identical
+                # peak-normalize + limiter chain (see CONTINUE_SPLICE_SOURCE).
+                _c = params.get("continue")
+                if CONTINUE_SPLICE_SOURCE and _c:
+                    audio, _info = _splice_continuation_source(
+                        audio, _c, sample_rate, session_id
+                    )
+                    print(f"[{session_id}] continue splice: {_info}")
 
                 # Stage 2a: post-decode peak-normalize (ace lever 2). Off by
                 # default — pins dynamics; kept for A/B. Silence-guarded.
@@ -1017,6 +1303,7 @@ def generation_worker(session_id: str, params: dict):
                     "total_duration": round(cont["total_duration"], 6),
                     "mask_start_seconds": round(cont["mask_start_seconds"], 6),
                     "mask_end_seconds": round(cont["mask_end_seconds"], 6),
+                    "mask_overlap": round(cont.get("mask_overlap", 0.0), 6),
                     "tail_mode": cont.get("tail_mode"),
                     "tail_pad": cont.get("tail_pad"),
                     "gen_duration": round(cont.get("gen_duration",
@@ -1082,6 +1369,9 @@ def health():
                 for i, (n, _) in enumerate(lora_registry)
             ],
             "default_lora": DEFAULT_LORA_NAME,
+            "decoder_lora": decoder_lora_name,
+            "decoder_lora_strength": (
+                DECODER_LORA_STRENGTH if decoder_lora_name else None),
             "device": model_device,
             "cuda_available": torch.cuda.is_available(),
             "cuda_mem": cuda_mem_mb(),
@@ -1107,6 +1397,11 @@ def loras():
         ],
         "default_lora": DEFAULT_LORA_NAME,
         "lora_dir": LORA_DIR,
+        # Reported for visibility but NOT selectable: it targets the decoder,
+        # so offering it as a DiT LoRA would be meaningless.
+        "decoder_lora": decoder_lora_name,
+        "decoder_lora_strength": (
+            DECODER_LORA_STRENGTH if decoder_lora_name else None),
     })
 
 
@@ -1642,6 +1937,22 @@ def continue_audio():
                             "error": "continuation_tail_pad must be >= 0"}), 400
         tail_pad = min(tail_pad, CONTINUE_TAIL_PAD_MAX)
 
+        # Mask overlap — pull mask_start back before the true source end so the
+        # seam lands mid-phrase instead of on the bar line (see
+        # CONTINUE_MASK_OVERLAP). Per-request override; env default. Clamp so we
+        # always keep a little real source to condition on (never the whole clip).
+        try:
+            mask_overlap = _opt_float(
+                data, "continuation_mask_overlap", CONTINUE_MASK_OVERLAP
+            )
+        except ValueError as e:
+            return jsonify({"success": False, "error": str(e)}), 400
+        if mask_overlap < 0:
+            return jsonify({"success": False,
+                            "error": "continuation_mask_overlap must be >= 0"}), 400
+        mask_overlap = min(mask_overlap, max(0.0, source_duration - 0.05))
+        mask_start = max(0.0, source_duration - mask_overlap)
+
         # Generate a touch long; worker hard-trims to exact total length.
         # Tail behavior env-toggled so the early-fade fix is A/B-able on one
         # image from the DAW (see CONTINUE_TAIL_MODE).
@@ -1666,8 +1977,10 @@ def continue_audio():
             "tail_mode": CONTINUE_TAIL_MODE,
             "tail_pad": tail_pad,
             "gen_duration": gen_duration,
-            # keep [0, source] ; regenerate [source, mask_end]
-            "mask_start_seconds": source_duration,
+            "mask_overlap": mask_overlap,
+            # keep [0, mask_start] ; regenerate [mask_start, mask_end]. mask_start
+            # = source_duration - mask_overlap so the seam lands mid-phrase.
+            "mask_start_seconds": mask_start,
             "mask_end_seconds": mask_end,
             "input_sr": in_sr,
             "input_channels": in_channels,
@@ -1693,6 +2006,10 @@ def continue_audio():
             "continuation_mode": mode,
             "tail_mode": CONTINUE_TAIL_MODE,
             "continuation_tail_pad": round(tail_pad, 4),
+            "continuation_mask_overlap": round(mask_overlap, 6),
+            "mask_start_seconds": round(mask_start, 6),
+            "splice_source": CONTINUE_SPLICE_SOURCE,
+            "splice_xfade": round(CONTINUE_SPLICE_XFADE, 6),
             "source_duration": round(source_duration, 6),
             "continuation_seconds": round(continuation_seconds, 6),
             "total_duration": round(total_duration, 6),
