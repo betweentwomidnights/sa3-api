@@ -100,7 +100,7 @@ saved as `sa3loop_<sid>_<seed>.wav`.
 
 | field           | default       | notes |
 |-----------------|---------------|-------|
-| `prompt`        | — (required)  | |
+| `prompt`        | `""`          | Optional; blank enables unconditional generation. |
 | `negative_prompt`| `low quality`| |
 | `duration`      | `30`          | seconds, max 300 |
 | `steps`         | `8`           | ARC default |

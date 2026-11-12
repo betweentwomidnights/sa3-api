@@ -29,6 +29,8 @@ samples, with zero hard clip; base model / continuation source pass untouched.
 | `SA3_LATENT_SHIFT` | `latent_shift` | `0.0` | Latent add before decode (`0.0` = off). |
 | `SA3_LATENT_TARGET_STD` | `latent_target_std` | *(off)* | Adaptive: scale latents *toward* this global std instead of a constant factor (base ≈ untouched, hot LoRA attenuated). Supersedes `latent_rescale` when set; try ~`0.9`. |
 | `SA3_CONTINUE_TAIL_PAD` | `continuation_tail_pad` | `6` | `/continue` only — the musical "ending vs seamless" dial (`0` = full composed ending at the cut, `~6` = natural wind-down, `~20+` = seamless). Range 0–60. Already a good advanced slider. |
+| `SA3_TAIL_PAD` | `tail_pad` | `0` | Same dial for **`/generate`** (from-scratch, plain `duration`). `0` = the model composes an ending at `duration` (current/legacy behavior); `~20+` = no taper, so the clip can be chained into `/continue`. Range 0–60. Generates `duration + tail_pad` and trims back. |
+| `SA3_LOOP_PAD_SECONDS` | `tail_pad` | `2` | Same field on **`/generate/loop`**, where it defaults to the historical 2s trim margin. `0` = composed ending on the last bar; `~20` = a 4/8/16-bar loop with no fade, ready to chain. Output stays sample-exact either way. |
 
 Override semantics: send the field in the request JSON; omit or `""` → env default;
 the dB fields also accept `"off"`/`"none"` to disable.

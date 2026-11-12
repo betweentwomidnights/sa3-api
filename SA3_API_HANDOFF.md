@@ -31,7 +31,7 @@ All accept JSON. Shared optional fields (defaults in parens):
 
 | field | default | notes |
 |---|---|---|
-| `prompt` | (required) | see "Prompt responsibilities" below |
+| `prompt` | `""` | Optional; blank enables unconditional generation. See "Prompt responsibilities" below. |
 | `negative_prompt` | `"low quality"` | |
 | `steps` | `8` | ARC default; don't expose unless "advanced" |
 | `cfg_scale` | `1.0` | ARC runs at 1.0; leave it |
@@ -52,17 +52,39 @@ All accept JSON. Shared optional fields (defaults in parens):
 > response `meta.loudness` echoes what was applied.
 
 ### `POST /sa3/generate` — text → audio
-Extra: `duration` (float secs, default 30, max 300).
-Returns `{success, session_id, seed, prompt, duration}`.
+Extra:
+- `duration` — float secs, default 30, max 300.
+- `tail_pad` — float secs, **default `0`** (range `0`–`60`). The "does it end
+  or does it keep going" dial, same idea as `continuation_tail_pad` below. The
+  model composes a *finite* piece and plans an ending at whatever length you
+  ask for; `tail_pad` asks for `duration + tail_pad` and trims back, so the
+  ending falls in the discarded part.
+  - `0` (default) ≈ composed ending right at `duration` — legacy behavior,
+    good for a one-shot "finished" clip.
+  - `~6` ≈ natural wind-down, a little tail left in.
+  - `~20+` ≈ no taper at all, full energy through the last sample — use this
+    when the clip is going to be chained into `/continue`.
+
+  Costs generation time proportional to the pad (it really does sample the
+  extra seconds). Output length is unchanged — always exactly `duration`.
+
+Returns `{success, session_id, seed, prompt, duration, tail_pad, gen_duration}`
+(`duration` = the audio you get; `gen_duration` = what the model was asked for).
 
 ### `POST /sa3/generate/loop` — bar-aligned loop
 **No `duration`.** Extra:
 - `bars` — `4`\|`8`\|`16`\|`32` (default 8)
 - `bpm` — optional; normally **parsed from the prompt** (the VST already
   writes "… 124 bpm …" — see below). Pass `bpm` only as an override.
+- `tail_pad` — float secs, **default `2`** (the server's `SA3_LOOP_PAD_SECONDS`;
+  range `0`–`60`). Same dial as on `/generate`, and here it doubles as the
+  sample-exactness margin. `0` = the loop composes an ending on its last bar;
+  `~20` = a 4/8/16-bar loop with no fade or ending at all, which is what you
+  want if the user is going to chain continuations off it. The trimmed output
+  is bar-exact either way.
 
 Output is sample-exact bar length. Returns `{… bpm, bars,
-seconds_per_bar, loop_duration, gen_duration, target_samples}`.
+seconds_per_bar, loop_duration, gen_duration, tail_pad, target_samples}`.
 
 ### `POST /sa3/transform` — style transfer of recorded audio
 **No `duration` — output length == input length.** Extra:

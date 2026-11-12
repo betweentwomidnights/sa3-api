@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "source": {
+    "lora": "ratatat",
+    "captions_dir": "/home/kev/ratatat_classics",
+    "files": 10,
+    "unique_genres": 6
+  },
+  "dice": {
+    "instrumental": [
+      "Lo-fi electronic",
+      "folk funk",
+      "Chiptune",
+      "Indie rock",
+      "funk soul-jazz",
+      "neo-soul"
+    ]
+  }
+}

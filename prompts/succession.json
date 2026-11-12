@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "source": {
+    "lora": "succession",
+    "captions_dir": "/home/kev/ace/training/succession",
+    "files": 92,
+    "unique_genres": 33,
+    "field": "ace sidecar genre:"
+  },
+  "dice": {
+    "instrumental": [
+      "Instrumental",
+      "cinematic orchestral",
+      "Orchestral cinematic",
+      "Orchestral",
+      "cinematic",
+      "Instrumental, cinematic, piano",
+      "cinematic piano",
+      "cinematic rock",
+      "ambient",
+      "Acoustic fingerstyle",
+      "ambient synth",
+      "Flamenco",
+      "Post-rock",
+      "Bluegrass",
+      "Minimal ambient",
+      "neo-classical",
+      "Big Band",
+      "Orchestral whimsy",
+      "ambient downtempo",
+      "Orchestral epic",
+      "Lo-fi hip hop",
+      "Deep house",
+      "JanGLE     P",
+      "Instrumental, cinematic, ambient",
+      "ambient harp",
+      "Progressive metal",
+      "Breakcore",
+      "Instrumental metal",
+      "Instrumental, jazz fusion, cinematic",
+      "Contemporary classical",
+      "ambient cinematic",
+      "neo-romantic classical",
+      "contempOraRY solo"
+    ]
+  }
+}

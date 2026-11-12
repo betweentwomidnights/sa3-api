@@ -31,6 +31,7 @@ COPY loras /app/loras
 # swapped with a recreate rather than a rebuild.
 COPY decoder_loras /app/decoder_loras
 COPY api.py /app/api.py
+COPY lora_lanes.py /app/lora_lanes.py
 
 # Bake the container-invocation gotchas (see feedback_sa3_docker_invocation):
 #   - import root for the vendored package

@@ -31,6 +31,9 @@ import random
 import re
 import math
 import requests as http_requests
+from contextlib import nullcontext
+
+import lora_lanes
 
 # Public release (engine SOURCE_COMMIT ab06db7+) removed pipeline.py and merged
 # StableAudioPipeline into StableAudioModel — same internal layout (.model,
@@ -189,6 +192,29 @@ MANAGE_MODEL_LIFECYCLE = os.environ.get(
 # shift at all.
 VALID_SHIFTS = ["default", "none", "logsnr", "flux", "full"]
 
+# Outbound container. "wav" is the default forever: a request that omits
+# audio_format is byte-identical to what we shipped before FLAC existed, so
+# already-installed VST3s cannot be surprised into a format they can't decode.
+# "auto" mirrors whatever the client uploaded (magic-byte sniffed) and falls
+# back to wav when the endpoint has no input audio (/generate, /generate/loop).
+# Both containers carry the same 16-bit PCM, so this is transport-only.
+VALID_AUDIO_FORMATS = ["wav", "flac", "auto"]
+
+
+def sniff_audio_format(raw: bytes) -> str:
+    """Container of a decoded upload, by magic bytes. Defaults to wav."""
+    if raw[:4] == b"fLaC":
+        return "flac"
+    return "wav"
+
+
+def resolve_audio_format(params: dict) -> str:
+    """Concrete outbound container for this job: never returns 'auto'."""
+    fmt = (params.get("audio_format") or "wav").lower()
+    if fmt == "auto":
+        return params.get("_inbound_format") or "wav"
+    return fmt if fmt in ("wav", "flac") else "wav"
+
 # Legacy single-LoRA selectors (still accepted when "loras" list is absent).
 VALID_LORA = ["default", "none"]
 
@@ -199,6 +225,27 @@ VALID_LORA = ["default", "none"]
 VALID_LOOP_BARS = [4, 8, 16, 32]
 DEFAULT_LOOP_BARS = int(os.environ.get("SA3_DEFAULT_LOOP_BARS", "8"))
 LOOP_PAD_SECONDS = float(os.environ.get("SA3_LOOP_PAD_SECONDS", "2.0"))
+
+# Tail pad for the from-scratch endpoints — the same "ending vs seamless" knob
+# `continuation_tail_pad` gives /continue (see CONTINUE_TAIL_PAD below), applied
+# to /generate and /generate/loop.
+#
+# The model conditions on seconds_total and composes a FINITE piece: it plans a
+# wind-down/ending right at the requested duration. Ask for duration+pad, trim
+# back to duration, and the ending lands in the discarded part — so a loop can
+# be chained into continuations without a fade baked into its last bar.
+#   0    = ask for exactly `duration`; composed ending at the cut ("hear the end")
+#   ~2   = /generate/loop's historical default (also the sample-exact trim margin)
+#   ~6   = natural wind-down + a little tail
+#   ~20+ = no taper at all, hard cut at full energy (chainable loop)
+# The pad must exceed the model's end-anticipation horizon to fully remove the
+# taper — same A/B as /continue (api.py:214). Env = global default, request
+# field `tail_pad` overrides per call (no redeploy to retune).
+#
+# /generate default is 0 so existing callers are byte-identical to before;
+# /generate/loop defaults to SA3_LOOP_PAD_SECONDS, which it has always used.
+TAIL_PAD = float(os.environ.get("SA3_TAIL_PAD", "0.0"))
+TAIL_PAD_MAX = float(os.environ.get("SA3_TAIL_PAD_MAX", "60.0"))
 
 # /continue tail behavior — A/B-able on one image (flip compose env, recreate).
 # The legacy path sets duration=total+0.5 but mask_end=total, which (a) leaves a
@@ -286,8 +333,11 @@ CONTINUE_SPLICE_GAIN_MATCH = os.environ.get(
 # chunk-align slack — so the min() never clamps a legitimate length.
 # _adapt_sample_size still returns the *small* needed size for short gens
 # (it's a ceiling, not an allocation), so short requests are unaffected.
+# The max pad is whichever knob can stretch a request furthest: /continue's
+# continuation_tail_pad or /generate['/loop']'s tail_pad. max() keeps the
+# invariant if either ceiling is raised via env.
 MAX_SAMPLE_SIZE = int(
-    (MAX_DURATION + CONTINUE_TAIL_PAD_MAX + 40.0) * 44100
+    (MAX_DURATION + max(CONTINUE_TAIL_PAD_MAX, TAIL_PAD_MAX) + 40.0) * 44100
 )
 
 # Loudness/hot-output investigation (Plan item 2). When on, the worker takes
@@ -365,6 +415,24 @@ sessions_lock = threading.Lock()
 QUEUE_URL = os.environ.get("QUEUE_URL", "http://gpu-queue:8085").rstrip("/")
 
 
+def _store_queue_snapshot(session_id: str, d: dict):
+    """Copy the gpu-queue lane's numbers onto the session.
+
+    `position`/`estimated_wait_seconds`/`avg_seconds`/`queued_count` all come
+    from the lane itself (SimpleLane, same as the ace-step lanes), so
+    poll_status never has to invent any of them.
+    """
+    if not isinstance(d, dict):
+        return
+    update_session(
+        session_id,
+        queue_position=d.get("position"),
+        queue_eta_seconds=d.get("estimated_wait_seconds"),
+        queue_avg_seconds=d.get("avg_seconds"),
+        queue_queued_count=d.get("queued_count"),
+    )
+
+
 def _acquire_gpu_slot(session_id: str, timeout: float = 600.0) -> bool:
     """Register on the sa3 lane and block until our slot is ready.
     Returns True if we got the slot, False on timeout/error."""
@@ -380,10 +448,20 @@ def _acquire_gpu_slot(session_id: str, timeout: float = 600.0) -> bool:
 
         data = resp.json()
         if data.get("status", "") == "processing":
+            # position 0 / eta 0. Without this the no-queue case (the common one
+            # for a single user) reports a null position until the worker flips
+            # status to "generating".
+            _store_queue_snapshot(session_id, data)
             print(f"[{session_id}] GPU slot acquired immediately")
             return True
 
-        print(f"[{session_id}] Queued at position {data.get('position', '?')}, polling...")
+        # The registration response already knows our true position — record it
+        # now. Previously this was only printed, so for the first ~0.5s (until
+        # the poll loop below ran) the session still had its initial
+        # queue_position and poll_status reported a fabricated "position 1".
+        _store_queue_snapshot(session_id, data)
+        print(f"[{session_id}] Queued at position {data.get('position', '?')} "
+              f"(eta ~{data.get('estimated_wait_seconds')}s), polling...")
         deadline = time.time() + timeout
         while time.time() < deadline:
             time.sleep(0.5)
@@ -396,7 +474,7 @@ def _acquire_gpu_slot(session_id: str, timeout: float = 600.0) -> bool:
                     if pdata.get("status", "") == "processing":
                         print(f"[{session_id}] GPU slot acquired after queuing")
                         return True
-                    update_session(session_id, queue_position=pdata.get("position", 0))
+                    _store_queue_snapshot(session_id, pdata)
             except Exception as e:
                 print(f"[{session_id}] queue poll error: {e}")
 
@@ -434,7 +512,13 @@ def create_session(session_id: str, meta: dict):
             "audio_data": None,
             "error": None,
             "meta": meta,
-            "queue_position": 0,
+            # None = position not known yet (the lane hasn't answered).
+            # Deliberately NOT 0: poll_status used to do `... or 1`, which
+            # turned the 0 into a confident "you are number 1".
+            "queue_position": None,
+            "queue_eta_seconds": None,
+            "queue_avg_seconds": None,
+            "queue_queued_count": None,
             "created_at": time.time(),
         }
 
@@ -756,8 +840,11 @@ def resolve_loras(data: dict) -> list:
 def validate_request(data: dict) -> list:
     errors = []
 
-    if not (data.get("prompt") or "").strip():
-        errors.append("prompt is required")
+    # Stable Audio 3 supports unconditional generation. An omitted, null, or
+    # blank prompt is therefore valid and is normalized to "" in _build_params.
+    # Still reject non-string values so malformed JSON does not become a 500.
+    if data.get("prompt") is not None and not isinstance(data["prompt"], str):
+        errors.append("prompt must be a string")
 
     duration = data.get("duration", DEFAULT_DURATION)
     try:
@@ -786,6 +873,10 @@ def validate_request(data: dict) -> list:
     shift = (data.get("shift") or "default").lower()
     if shift not in VALID_SHIFTS:
         errors.append(f"shift must be one of {VALID_SHIFTS}")
+
+    audio_format = (data.get("audio_format") or "wav").lower()
+    if audio_format not in VALID_AUDIO_FORMATS:
+        errors.append(f"audio_format must be one of {VALID_AUDIO_FORMATS}")
 
     # LoRA selection (name resolution against the registry) is validated in
     # resolve_loras() after the warmup/ready gate, since it needs the registry.
@@ -954,6 +1045,19 @@ def generation_worker(session_id: str, params: dict):
                 }
                 for idx in range(n_loras)
             ] if n_loras else None
+            # Automation lanes (lora_lanes.py) drive every DiT adapter's strength
+            # per pass themselves; the strengths set above (request loras only)
+            # are what the conditioner's seconds token sees, as in sa3.cpp.
+            lane_plan = params.get("lanes")
+            if lane_plan is not None:
+                lora_configs = None
+
+                def lane_ctx():
+                    return lora_lanes.lanes_active(
+                        pipe, lane_plan, prompt, gen_kwargs["duration"], n_loras)
+                print(f"[{session_id}]   lanes: {json.dumps(lane_plan.describe())}")
+            else:
+                lane_ctx = nullcontext
 
             gen_kwargs = dict(
                 prompt=prompt,
@@ -1042,7 +1146,8 @@ def generation_worker(session_id: str, params: dict):
                 or norm_db is not None or lim_db is not None
             )
             if not use_latent_path:
-                audio = pipe.generate(**gen_kwargs)
+                with lane_ctx():
+                    audio = pipe.generate(**gen_kwargs)
                 _c = params.get("continue")
                 if CONTINUE_SPLICE_SOURCE and _c:
                     audio, _info = _splice_continuation_source(
@@ -1054,7 +1159,8 @@ def generation_worker(session_id: str, params: dict):
                 # we apply the loudness stages, then decode (mirror the gradio
                 # preview path: pretransform.decode -> [b,d,n]).
                 gen_kwargs["return_latents"] = True
-                latents = pipe.generate(**gen_kwargs)
+                with lane_ctx():
+                    latents = pipe.generate(**gen_kwargs)
 
                 if LATENT_DIAG:
                     lf = latents.detach().to(torch.float32)
@@ -1216,9 +1322,15 @@ def generation_worker(session_id: str, params: dict):
                 audio = audio[:, :tgt]
             else:
                 padded = True
-                print(f"[{session_id}] WARN short: have {have} < target "
-                      f"{tgt} samples; zero-padding {tgt - have}")
-                audio = torch.nn.functional.pad(audio, (0, tgt - have))
+                # A sub-millisecond shortfall is just rounding: the engine
+                # truncates to int(duration*sr) while the target is round()ed,
+                # so tail_pad=0 can land one sample short. Only shout when the
+                # gap is big enough to mean something went wrong.
+                short = tgt - have
+                if short > sample_rate // 100:
+                    print(f"[{session_id}] WARN short: have {have} < target "
+                          f"{tgt} samples; zero-padding {short}")
+                audio = torch.nn.functional.pad(audio, (0, short))
 
         if cont_diag is not None:
             post_rms, post_peak = _tail_db(audio)
@@ -1236,15 +1348,19 @@ def generation_worker(session_id: str, params: dict):
 
         final_duration = audio.shape[-1] / sample_rate
 
+        # Transport container only. `audio` is already int16 above, so FLAC and
+        # WAV carry identical samples — this is not an audio-quality change.
+        out_format = resolve_audio_format(params)
         buf = io.BytesIO()
-        torchaudio.save(buf, audio, sample_rate, format="wav")
+        torchaudio.save(buf, audio, sample_rate, format=out_format)
         audio_bytes = buf.getvalue()
         audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
 
         cont = params.get("continue")
         prefix = ("sa3cont" if cont else "sa3loop" if loop
                   else "sa3xform" if transform else "sa3")
-        filename = f"{prefix}_{session_id}_{seed}.wav"
+        # Extension must track the contents — these land in ~/sa3/outputs.
+        filename = f"{prefix}_{session_id}_{seed}.{out_format}"
         output_path = os.path.join(OUTPUT_DIR, filename)
         with open(output_path, "wb") as f:
             f.write(audio_bytes)
@@ -1265,8 +1381,15 @@ def generation_worker(session_id: str, params: dict):
                 "prompt": prompt,
                 "negative_prompt": negative_prompt,
                 "seed": seed,
+                # `duration` is what was asked of the MODEL (= requested +
+                # tail_pad); `final_duration` is the audio actually returned
+                # after the trim, i.e. what the frontend requested.
                 "duration": round(duration, 4),
                 "final_duration": round(final_duration, 4),
+                # Resolved server-side ("auto" already collapsed to a real
+                # container) so the client never has to guess.
+                "audio_format": out_format,
+                "tail_pad": params.get("tail_pad"),
                 "steps": steps,
                 "cfg_scale": cfg_scale,
                 "shift": shift,
@@ -1277,6 +1400,8 @@ def generation_worker(session_id: str, params: dict):
                      "layer_filter": c["layer_filter"]}
                     for c in loras
                 ],
+                "lora_lanes": (params["lanes"].describe()
+                               if params.get("lanes") is not None else None),
                 "model": MODEL_NAME,
                 "generation_time": round(gen_time, 2),
                 "model_load_time": cold_load_seconds,   # 0 if it was warm
@@ -1287,6 +1412,7 @@ def generation_worker(session_id: str, params: dict):
                     "seconds_per_bar": round(loop["seconds_per_bar"], 6),
                     "loop_duration": round(loop["loop_duration"], 6),
                     "gen_duration": round(loop["gen_duration"], 4),
+                    "tail_pad": loop.get("tail_pad"),
                     "target_samples": loop["target_samples"],
                 } if loop else None),
                 "transform": ({
@@ -1376,6 +1502,14 @@ def health():
             "cuda_available": torch.cuda.is_available(),
             "cuda_mem": cuda_mem_mb(),
             "sample_rate": model_sample_rate,
+            # Same names as sa3-server's /health.capabilities so gary4juce can
+            # feature-detect one contract on both backends.
+            "capabilities": {
+                "lora_lanes": True,
+                "lora_envelope_modes": ["velocity"],
+                "max_lanes": lora_lanes.MAX_LANES,
+                "max_lane_points": lora_lanes.MAX_ENVELOPE_POINTS,
+            },
         })
     return jsonify({"status": "starting", "model_loaded": False}), 503
 
@@ -1505,6 +1639,17 @@ def _opt_float(data, key, default):
         raise ValueError(f"{key} must be a number")
 
 
+def _resolve_tail_pad(data, env_default, key="tail_pad", cap=None):
+    """Request override for the tail pad (see TAIL_PAD). Absent/blank -> env
+    default; clamped to [0, cap]. Negative or non-numeric -> ValueError (→400),
+    so a frontend typo is never silently swallowed. /continue passes its own
+    key + cap so its long-standing field name and ceiling are unchanged."""
+    pad = _opt_float(data, key, env_default)
+    if pad < 0:
+        raise ValueError(f"{key} must be >= 0")
+    return min(pad, TAIL_PAD_MAX if cap is None else cap)
+
+
 def _resolve_db(data, key, env_default):
     """Shared resolver for ceiling-style dB request overrides. Absent -> env
     default; 'off'/'none' -> disabled; positive -> disabled (ceiling only)."""
@@ -1539,6 +1684,16 @@ def _resolve_limiter_db(data):
 def _build_params(data):
     """Shared param dict for /generate and /generate/loop. Caller has already
     validated and confirmed the model is ready. May raise ValueError (→400)."""
+    loras = resolve_loras(data)
+    prompt = (data.get("prompt") or "").strip()
+
+    def lane_index(name):
+        if name not in lora_name_to_index:
+            raise ValueError(
+                f"unknown LoRA '{name}'. available: {list(lora_name_to_index)}")
+        return lora_name_to_index[name]
+
+    lanes = lora_lanes.parse_lane_plan(data, loras, lane_index, prompt)
     return {
         # Loudness levers — per-request overrides of the env defaults, so they
         # can be A/B'd by ear without a redeploy. Apply to every gen endpoint.
@@ -1549,19 +1704,26 @@ def _build_params(data):
         ),
         "peak_normalize_db": _resolve_peak_db(data),
         "limiter_ceiling_db": _resolve_limiter_db(data),
-        "prompt": data["prompt"].strip(),
+        "prompt": prompt,
         "negative_prompt": (data.get("negative_prompt", DEFAULT_NEGATIVE) or "").strip(),
         "duration": float(data.get("duration", DEFAULT_DURATION)),
         "steps": int(data.get("steps", DEFAULT_STEPS)),
         "cfg_scale": float(data.get("cfg_scale", DEFAULT_CFG)),
         "shift": (data.get("shift") or "default").lower(),
         "sampler_type": data.get("sampler_type", DEFAULT_SAMPLER),
+        # Outbound container; "auto" is resolved at save time against
+        # _inbound_format, which /transform and /continue set below.
+        "audio_format": (data.get("audio_format") or "wav").lower(),
+        "_inbound_format": None,
         # Resolve -1 to a concrete seed HERE so the response/meta always
         # reports the exact seed used — required to reproduce a take.
         "seed": (lambda s: random.randint(0, 99999) if s == -1 else s)(
             int(data.get("seed", -1))
         ),
-        "loras": resolve_loras(data),
+        "loras": loras,
+        # LoRA automation lanes (lora_lanes.py; same contract as sa3-server).
+        # None = no automation requested -> byte-identical to the old path.
+        "lanes": lanes,
         "loop": None,
     }
 
@@ -1572,8 +1734,8 @@ def generate():
     Accept a text-to-audio request, return a session_id immediately.
     Generation runs in background — poll /poll_status/<session_id>.
 
-    Body (all optional except prompt):
-      prompt          (str, required)
+    Body (all optional):
+      prompt          (str, default ""; blank = unconditional generation)
       negative_prompt (str, default "low quality")
       duration        (float seconds, default 30, max 300)
       steps           (int, default 8)
@@ -1582,6 +1744,10 @@ def generate():
       sampler_type    (str, default "pingpong")
       seed            (int, default -1 = random)
       loras / lora    (see /loras; legacy lora/lora_strength supported)
+      tail_pad        (float seconds, default = env SA3_TAIL_PAD, 0..60)
+                      Generate this much PAST `duration` and trim back, so the
+                      model's composed ending falls outside the kept audio.
+                      0 = ending at the cut; ~20 = no taper, chainable.
     """
     cleanup_old_sessions()
     try:
@@ -1598,14 +1764,27 @@ def generate():
 
         try:
             params = _build_params(data)
+            tail_pad = _resolve_tail_pad(data, TAIL_PAD)
         except ValueError as e:
             return jsonify({"success": False, "error": str(e)}), 400
+
+        # Tail pad: condition the model on duration+pad so it composes its
+        # ending past the cut, then hard-trim to the requested length in the
+        # worker. pad=0 leaves the request byte-identical to the old path (no
+        # target_samples => no trim, so no 1-sample rounding pad either).
+        duration = params["duration"]
+        gen_duration = duration + tail_pad
+        params["tail_pad"] = tail_pad
+        if tail_pad > 0:
+            sr = int(model_sample_rate or 44100)
+            params["duration"] = gen_duration
+            params["target_samples"] = round(duration * sr)
 
         session_id = str(uuid.uuid4())[:12]
         create_session(session_id, {
             "prompt": params["prompt"],
             "steps": params["steps"],
-            "duration": params["duration"],
+            "duration": duration,
         })
 
         threading.Thread(
@@ -1617,7 +1796,9 @@ def generate():
             "session_id": session_id,
             "seed": params["seed"],
             "prompt": params["prompt"],
-            "duration": params["duration"],
+            "duration": duration,
+            "tail_pad": round(tail_pad, 4),
+            "gen_duration": round(gen_duration, 4),
         })
 
     except Exception as e:
@@ -1635,8 +1816,13 @@ def generate_loop():
     /poll_status/<session_id>.
 
     Body: same as /generate, plus:
-      bars  (int, default 8; one of [4, 8, 16, 32])
-      bpm   (float, optional — overrides BPM parsed from the prompt)
+      bars     (int, default 8; one of [4, 8, 16, 32])
+      bpm      (float, optional — overrides BPM parsed from the prompt)
+      tail_pad (float seconds, default = env SA3_LOOP_PAD_SECONDS) — how far
+               past the bar-exact length to generate before trimming. Doubles
+               as the sample-exactness margin and as the "does this loop end or
+               keep going" dial: 0 = composed ending on the last bar, ~20 = no
+               taper, chain it straight into /continue.
     """
     cleanup_old_sessions()
     try:
@@ -1651,7 +1837,7 @@ def generate_loop():
         if not pipe_ready.is_set():
             return jsonify({"success": False, "error": "loading model — warming up"}), 503
 
-        prompt = data["prompt"].strip()
+        prompt = (data.get("prompt") or "").strip()
         bpm = data.get("bpm")
         bpm = float(bpm) if bpm not in (None, "") else extract_bpm(prompt)
         if not bpm or bpm <= 0:
@@ -1668,17 +1854,25 @@ def generate_loop():
                 "error": f"bars must be one of {VALID_LOOP_BARS}",
             }), 400
 
+        try:
+            tail_pad = _resolve_tail_pad(data, LOOP_PAD_SECONDS)
+        except ValueError as e:
+            return jsonify({"success": False, "error": str(e)}), 400
+
         sr = int(model_sample_rate or 44100)
         seconds_per_bar = (60.0 / bpm) * 4.0          # 4/4
         loop_duration = seconds_per_bar * bars
-        gen_duration = loop_duration + LOOP_PAD_SECONDS
+        gen_duration = loop_duration + tail_pad
         target_samples = round(loop_duration * sr)
 
-        if gen_duration > MAX_DURATION:
+        # The KEPT loop must fit MAX_DURATION; the pad may run past it (same
+        # rule as /continue, where gen = total + continuation_tail_pad). The
+        # sampler canvas is sized for it — see MAX_SAMPLE_SIZE.
+        if loop_duration > MAX_DURATION:
             return jsonify({
                 "success": False,
                 "error": f"{bars} bars @ {bpm} bpm = {loop_duration:.2f}s "
-                         f"(+{LOOP_PAD_SECONDS}s pad) exceeds max {MAX_DURATION}s "
+                         f"exceeds max {MAX_DURATION}s "
                          f"— pick fewer bars or a faster bpm",
             }), 400
 
@@ -1690,12 +1884,14 @@ def generate_loop():
         # Generate the padded length; worker trims to target_samples exactly.
         params["duration"] = gen_duration
         params["target_samples"] = target_samples
+        params["tail_pad"] = tail_pad
         params["loop"] = {
             "bpm": bpm,
             "bars": bars,
             "seconds_per_bar": seconds_per_bar,
             "loop_duration": loop_duration,
             "gen_duration": gen_duration,
+            "tail_pad": tail_pad,
             "target_samples": target_samples,
         }
 
@@ -1720,6 +1916,7 @@ def generate_loop():
             "seconds_per_bar": round(seconds_per_bar, 6),
             "loop_duration": round(loop_duration, 6),
             "gen_duration": round(gen_duration, 4),
+            "tail_pad": round(tail_pad, 4),
             "target_samples": target_samples,
         })
 
@@ -1758,7 +1955,7 @@ def transform():
         b64 = data.get("audio_data")
         if not b64:
             return jsonify({"success": False,
-                            "error": "audio_data (base64 WAV) is required"}), 400
+                            "error": "audio_data (base64 WAV or FLAC) is required"}), 400
         try:
             raw = base64.b64decode(b64)
             waveform, in_sr = torchaudio.load(io.BytesIO(raw))  # [C, T] float
@@ -1785,6 +1982,9 @@ def transform():
             params = _build_params(data)
         except ValueError as e:
             return jsonify({"success": False, "error": str(e)}), 400
+
+        # What the client uploaded — only consulted when audio_format="auto".
+        params["_inbound_format"] = sniff_audio_format(raw)
 
         # Generate a touch long (so the model isn't fighting the exact tail),
         # then the worker hard-trims to exactly the input's frame count — the
@@ -1877,7 +2077,7 @@ def continue_audio():
         b64 = data.get("audio_data")
         if not b64:
             return jsonify({"success": False,
-                            "error": "audio_data (base64 WAV) is required"}), 400
+                            "error": "audio_data (base64 WAV or FLAC) is required"}), 400
         try:
             raw = base64.b64decode(b64)
             waveform, in_sr = torchaudio.load(io.BytesIO(raw))   # [C, T]
@@ -1917,6 +2117,9 @@ def continue_audio():
         except ValueError as e:
             return jsonify({"success": False, "error": str(e)}), 400
 
+        # What the client uploaded — only consulted when audio_format="auto".
+        params["_inbound_format"] = sniff_audio_format(raw)
+
         # latent_prefix is imposed only inside sample_flow_pingpong, so force the
         # pingpong sampler for this mode (no-op for the default).
         if mode == "latent_prefix" and params.get("sampler_type") != "pingpong":
@@ -1929,13 +2132,13 @@ def continue_audio():
         # CONTINUE_TAIL_PAD. 0 ≈ full composed ending at `total`; ~6 natural
         # wind-down + a little tail; higher ≈ seamless. Only used in regen_past.
         try:
-            tail_pad = _opt_float(data, "continuation_tail_pad", CONTINUE_TAIL_PAD)
+            tail_pad = _resolve_tail_pad(
+                data, CONTINUE_TAIL_PAD,
+                key="continuation_tail_pad", cap=CONTINUE_TAIL_PAD_MAX,
+            )
         except ValueError as e:
             return jsonify({"success": False, "error": str(e)}), 400
-        if tail_pad < 0:
-            return jsonify({"success": False,
-                            "error": "continuation_tail_pad must be >= 0"}), 400
-        tail_pad = min(tail_pad, CONTINUE_TAIL_PAD_MAX)
+        params["tail_pad"] = tail_pad      # uniform meta.tail_pad across endpoints
 
         # Mask overlap — pull mask_start back before the true source end so the
         # seam lands mid-phrase instead of on the bar line (see
@@ -2123,17 +2326,55 @@ def poll_status(session_id: str):
 
     queue_status = {}
     if status == "queued":
-        position = session.get("queue_position", 1) or 1
-        estimated_seconds = max(5, position * 20)
-        queue_status = {
-            "status": "queued",
-            "position": position,
-            "total_queued": position,
-            "message": f"Task queued successfully. You are number {position} in the queue. "
-                       f"Estimated wait time: ~{estimated_seconds}s.",
-            "estimated_time": f"~{estimated_seconds}s",
-            "estimated_seconds": estimated_seconds,
-        }
+        # Everything here comes from the gpu-queue sa3 lane. `estimated_seconds`
+        # is position x the lane's EWMA of real completed-job durations, not the
+        # old hardcoded position*20.
+        position = session.get("queue_position")
+        eta = session.get("queue_eta_seconds")
+        queued_count = session.get("queue_queued_count")
+
+        if position is None:
+            # Sub-second window between create_session and the lane answering.
+            # Report honestly rather than guessing a position we don't have.
+            queue_status = {
+                "status": "queued",
+                "position": None,
+                "total_queued": queued_count,
+                "message": "Task queued successfully. Determining queue position...",
+                "estimated_time": None,
+                "estimated_seconds": None,
+            }
+        elif position == 0:
+            queue_status = {
+                "status": "ready",
+                "position": 0,
+                "total_queued": queued_count or 0,
+                "message": "Starting generation...",
+                "estimated_time": "~0s",
+                "estimated_seconds": 0,
+                "avg_seconds": session.get("queue_avg_seconds"),
+            }
+        else:
+            estimated_seconds = int(round(eta)) if eta is not None else None
+            if estimated_seconds is not None:
+                msg = (f"Task queued successfully. You are number {position} in "
+                       f"the queue. Estimated wait time: ~{estimated_seconds}s.")
+                etime = f"~{estimated_seconds}s"
+            else:
+                msg = (f"Task queued successfully. You are number {position} in "
+                       f"the queue.")
+                etime = None
+            queue_status = {
+                "status": "queued",
+                "position": position,
+                # Real count of tasks waiting on the lane. This used to echo
+                # `position`, which is a different quantity entirely.
+                "total_queued": queued_count if queued_count is not None else position,
+                "message": msg,
+                "estimated_time": etime,
+                "estimated_seconds": estimated_seconds,
+                "avg_seconds": session.get("queue_avg_seconds"),
+            }
     elif status in ("generating", "encoding"):
         queue_status = {"status": "ready"}
 
@@ -2149,6 +2390,9 @@ def poll_status(session_id: str):
     if status == "completed":
         response["audio_data"] = session.get("audio_data", "")
         response["meta"] = session.get("meta", {})
+        # Sits next to audio_data so a client can pick a decoder without
+        # digging into meta or sniffing. Always a real container, never "auto".
+        response["audio_format"] = (session.get("meta", {}) or {}).get("audio_format", "wav")
     elif status == "failed":
         response["success"] = False
         response["error"] = session.get("error", "unknown error")
